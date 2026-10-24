@@ -1,7 +1,7 @@
 """PenPad - PC app (Windows 10 1809+ / 11).
 Tray app. The phone finds this PC automatically (USB tethering or same Wi-Fi),
 pen strokes are injected as a real pen, recognised text is typed."""
-import base64, ctypes, json, os, socket, sys, threading, time
+import base64, ctypes, json, math, os, socket, sys, threading, time
 from ctypes import wintypes as w
 import winreg
 import pystray
@@ -11,15 +11,12 @@ APP = "PenPad"
 PORT = 5555          # phone connects here (TCP)
 DISC_PORT = 5556     # this app announces itself here (UDP)
 
-BAND_W = 700         # writing line length on PC (pixels)
-BAND_H = 160         # writing line height on PC (pixels)
-GAIN = 3.0           # cursor speed in move mode
-TRIGGER = 0.7        # auto-advance: previous stroke ended beyond this...
-RESTART = 0.4        # ...and next stroke starts before this
-GAP = 20             # space between words (pixels)
-LINE_SPACING = 1.2   # new-line distance as multiple of BAND_H
-CLICK_TO_FOCUS = True
-TYPE_SPACE = True
+DRAW_SCALE = 1.2     # PC pixels per phone pixel while drawing (bigger = bigger drawings)
+GAIN = 1.5           # cursor speed in move mode (slow finger)
+ACCEL = 0.10         # extra speed the faster you swipe
+MAX_GAIN = 5.0       # speed limit
+CLICK_TO_FOCUS = True  # TEXT tool: click once at the cursor so a text box gets focus
+TYPE_SPACE = True      # TEXT tool: add a space after each finished word
 
 PT_PEN = 3
 F_NEW, F_INRANGE, F_INCONTACT, F_FIRSTBTN = 0x1, 0x2, 0x4, 0x10
@@ -91,12 +88,11 @@ def set_status(s):
 
 # ---------------- pen / keyboard injection ----------------
 mode = "move"
-origin = (0, 0)
 pen_down = False
 last_px = last_py = 0
-line_x0 = 0
-prev_end = None
-last_nx = 0.0
+anchor = None        # (phone_x, phone_y, pc_x, pc_y): first touch of a draw session = cursor spot
+rem_x = rem_y = 0.0  # sub-pixel remainder so slow movement is never lost
+live = ""            # text currently typed on the PC by the TEXT tool
 clicked = False
 
 def inject(flags, px, py, pressure):
@@ -112,43 +108,40 @@ def inject(flags, px, py, pressure):
     p.pressure = int(max(0.0, min(1.0, pressure)) * 1024)
     user32.InjectSyntheticPointerInput(dev, ctypes.byref(t), 1)
 
-def type_text(text):
-    evs = []
-    def key(vk=0, scan=0, flags=0):
-        i = INPUT(); i.type = 1
-        i.u.ki = KEYBDINPUT(vk, scan, flags, 0, 0)
-        evs.append(i)
-    for ch in text:
-        if ch == "\n":
-            key(vk=0x0D); key(vk=0x0D, flags=0x2)
-            continue
-        b = ch.encode("utf-16-le")
-        for k in range(0, len(b), 2):
-            unit = b[k] | (b[k + 1] << 8)
-            key(scan=unit, flags=0x4)
-            key(scan=unit, flags=0x4 | 0x2)
+def _key(evs, vk=0, scan=0, flags=0):
+    i = INPUT(); i.type = 1
+    i.u.ki = KEYBDINPUT(vk, scan, flags, 0, 0)
+    evs.append(i)
+
+def send_inputs(evs):
     if evs:
         arr = (INPUT * len(evs))(*evs)
         user32.SendInput(len(evs), arr, ctypes.sizeof(INPUT))
 
+def type_text(text):
+    evs = []
+    for ch in text:
+        if ch == "\n":
+            _key(evs, vk=0x0D); _key(evs, vk=0x0D, flags=0x2)
+            continue
+        b = ch.encode("utf-16-le")
+        for k in range(0, len(b), 2):
+            unit = b[k] | (b[k + 1] << 8)
+            _key(evs, scan=unit, flags=0x4)
+            _key(evs, scan=unit, flags=0x6)
+    send_inputs(evs)
+
+def backspace(n):
+    evs = []
+    for _ in range(n):
+        _key(evs, vk=0x08); _key(evs, vk=0x08, flags=0x2)
+    send_inputs(evs)
+
 def cursor():
     pt = w.POINT(); user32.GetCursorPos(ctypes.byref(pt)); return pt.x, pt.y
 
-def advance(nx):
-    global origin, prev_end
-    if prev_end is not None and prev_end > TRIGGER and nx < RESTART:
-        ox = origin[0] + prev_end * BAND_W + GAP
-        oy = origin[1]
-        if ox + BAND_W > SW:
-            ox = line_x0
-            oy = min(SH - 1, oy + BAND_H * LINE_SPACING)
-        origin = (ox, oy)
-    prev_end = None
-
-def to_screen(x, y):
-    px = origin[0] + x * BAND_W
-    py = origin[1] + (y - 0.5) * BAND_H
-    return max(0, min(SW - 1, px)), max(0, min(SH - 1, py))
+def clamp(v, size):
+    return max(0, min(size - 1, v))
 
 def pen_up():
     global pen_down
@@ -157,48 +150,67 @@ def pen_up():
         pen_down = False
 
 def reset_state():
-    global mode, pen_down, prev_end, clicked
-    mode = "move"; pen_down = False; prev_end = None; clicked = False
+    global mode, pen_down, anchor, rem_x, rem_y, live, clicked
+    mode = "move"; pen_down = False; anchor = None
+    rem_x = rem_y = 0.0; live = ""; clicked = False
+
+def focus_click():
+    global clicked
+    if CLICK_TO_FOCUS and not clicked:
+        user32.mouse_event(0x2, 0, 0, 0, 0); user32.mouse_event(0x4, 0, 0, 0, 0)
+        time.sleep(0.2); clicked = True
 
 def handle(line):
-    global mode, origin, pen_down, last_px, last_py, line_x0, prev_end, last_nx, clicked
+    global mode, pen_down, last_px, last_py, anchor, rem_x, rem_y, live, clicked
     f = line.split(",")
     c = f[0]
-    if c == "M":
+    if c == "M":                          # mode switch: move <-> draw
         pen_up()
-        mode = f[1]
-        if mode == "draw":
-            origin = cursor()
-            line_x0 = origin[0]; prev_end = None; clicked = False
-    elif c == "R" and mode == "move":
-        cx, cy = cursor()
-        nx = max(0, min(SW - 1, cx + float(f[1]) * GAIN))
-        ny = max(0, min(SH - 1, cy + float(f[2]) * GAIN))
-        user32.SetCursorPos(int(nx), int(ny))
-    elif c in ("D", "V") and mode == "draw":
-        nx = float(f[1]); pr = float(f[3])
-        new_stroke = (c == "D" or not pen_down)
-        if new_stroke:
-            advance(nx)
-        px, py = to_screen(nx, float(f[2]))
-        last_nx = nx
-        if new_stroke:
+        mode = f[1]; anchor = None; clicked = False; live = ""
+    elif c == "R" and mode == "move":     # finger delta -> cursor (touchpad style, with acceleration)
+        dx, dy = float(f[1]), float(f[2])
+        g = min(MAX_GAIN, GAIN + ACCEL * math.hypot(dx, dy))
+        rem_x += dx * g; rem_y += dy * g
+        ix, iy = int(rem_x), int(rem_y)   # whole pixels only; keep the fraction
+        rem_x -= ix; rem_y -= iy
+        if ix or iy:
+            cx, cy = cursor()
+            user32.SetCursorPos(clamp(cx + ix, SW), clamp(cy + iy, SH))
+    elif c in ("D", "V") and mode == "draw":   # freestyle pen, phone pixels
+        x, y, pr = float(f[1]), float(f[2]), float(f[3])
+        if anchor is None:                # first touch lands exactly at the cursor
+            cx, cy = cursor()
+            anchor = (x, y, cx, cy)
+        px = clamp(anchor[2] + (x - anchor[0]) * DRAW_SCALE, SW)
+        py = clamp(anchor[3] + (y - anchor[1]) * DRAW_SCALE, SH)
+        if c == "D" or not pen_down:
             inject(F_NEW | F_INRANGE | F_INCONTACT | F_FIRSTBTN | F_DOWN, px, py, pr)
             pen_down = True
         else:
             inject(F_INRANGE | F_INCONTACT | F_FIRSTBTN | F_UPDATE, px, py, pr)
         last_px, last_py = px, py
-    elif c == "T" and mode == "draw":
-        text = base64.b64decode(f[1]).decode("utf-8")
-        if CLICK_TO_FOCUS and not clicked:
-            user32.mouse_event(0x2, 0, 0, 0, 0); user32.mouse_event(0x4, 0, 0, 0, 0)
-            time.sleep(0.2); clicked = True
-        type_text(text + (" " if TYPE_SPACE else ""))
+    elif c == "T":                        # TEXT tool: live text; fix only what changed
+        new = base64.b64decode(f[1]).decode("utf-8")
+        focus_click()
+        p = 0
+        m = min(len(live), len(new))
+        while p < m and live[p] == new[p]:
+            p += 1
+        if len(live) > p: backspace(len(live) - p)
+        if new[p:]: type_text(new[p:])
+        live = new
+    elif c == "C":                        # word finished
+        if live and TYPE_SPACE: type_text(" ")
+        live = ""
+    elif c == "L":                        # tap in KEYS tool = left click, fresh typing baseline
+        user32.mouse_event(0x2, 0, 0, 0, 0); user32.mouse_event(0x4, 0, 0, 0, 0)
+        clicked = True; live = ""
+    elif c == "B":                        # backspace into earlier text
+        backspace(1)
+    elif c == "N":                        # new typing baseline (text so far stays)
+        live = ""
     elif c == "U":
-        was = pen_down
         pen_up()
-        if was:
-            prev_end = last_nx
 
 # ---------------- pairing ----------------
 DATA_DIR = os.path.join(os.environ.get("APPDATA", "."), APP)
