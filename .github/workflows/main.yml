@@ -1,0 +1,35 @@
+name: Build PenPad
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+jobs:
+  pc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r pc/requirements.txt pyinstaller
+      - run: pyinstaller --onefile --noconsole --name PenPad --hidden-import pystray._win32 pc/penpad.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PenPad-Windows
+          path: dist/PenPad.exe
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - run: gradle -p android assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PenPad-Android
+          path: android/app/build/outputs/apk/debug/app-debug.apk
